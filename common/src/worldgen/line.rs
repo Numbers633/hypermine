@@ -31,7 +31,8 @@ impl LineSegment {
         };
         let closest_point_on_segment =
             (self.start.as_ref() + self.start_to_end * h).normalized_point();
-        (-closest_point_on_segment.mip(point)).acosh()
+        // Roundoff can put the hyperbolic cosine just below 1, where `acosh` is NaN.
+        (-closest_point_on_segment.mip(point)).max(1.0).acosh()
     }
 }
 
@@ -53,5 +54,15 @@ mod tests {
         assert_abs_diff_eq!(segment.distance_to(&along(1.5)), 0.5, epsilon = 1e-5);
         let degenerate = LineSegment::new(start, start);
         assert_abs_diff_eq!(degenerate.distance_to(&along(0.5)), 0.5, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn segment_distance_clamps_roundoff_below_acosh_domain() {
+        // Renormalizing this point rounds the cosh-like product below 1.
+        let point =
+            MIsometry::translation_along(&na::Vector3::new(0.0008, 0.0, 0.0)) * MPoint::origin();
+        assert!(-(point.as_ref().normalized_point().mip(&point)) < 1.0);
+        let segment = LineSegment::new(point, point);
+        assert!(segment.distance_to(&point).is_finite());
     }
 }
