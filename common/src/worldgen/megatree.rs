@@ -43,6 +43,7 @@ struct DiagonalState {
 
 impl MegatreeState {
     pub fn new(graph: &Graph, node: NodeId, kind: NodeStateKind, enviro: EnviroFactors) -> Self {
+        let mut rng = node_rng(graph, node);
         let graph_parent_sides = graph
             .parents(node)
             .map(|(side, _)| side)
@@ -55,6 +56,7 @@ impl MegatreeState {
             enviro,
             tree_parent_sides,
             graph_parent_sides,
+            &mut rng,
         );
         let mut incoming_signals = Vec::new();
         for (side, parent) in graph.parents(node) {
@@ -99,26 +101,7 @@ impl MegatreeState {
             && matches!(kind, NodeStateKind::Sky | NodeStateKind::DeepSky)
             && tree_node.remaining_growth >= 0.0
         {
-            let spice = graph.hash_of(node) as u64;
-            let mut rng = Pcg64Mcg::seed_from_u64(super::hash(spice, DIAGONAL_SEED));
-            for target_sides in edge_propagation_sets(tree_parent_sides) {
-                if rng.random::<f32>() < branch_probability(enviro) {
-                    has_diagonal_children = true;
-                    let signal = CarrierSignal {
-                        source: node,
-                        target_sides,
-                        crossed_sides: SideSet::EMPTY,
-                        remaining_growth: tree_node.remaining_growth,
-                    };
-                    segments.push(signal.segment());
-                    for side in Side::iter().filter(|side| target_sides.contains(*side)) {
-                        let mut next = signal;
-                        next.crossed_sides.insert(side);
-                        outgoing.push((side, next));
-                    }
-                }
-            }
-            for target_sides in vertex_propagation_sets(tree_parent_sides) {
+            for target_sides in diagonal_propagation_sets(tree_parent_sides) {
                 if rng.random::<f32>() < branch_probability(enviro) {
                     has_diagonal_children = true;
                     let signal = CarrierSignal {
@@ -162,7 +145,10 @@ impl MegatreeState {
     }
 }
 
-const DIAGONAL_SEED: u64 = 10655026474825314811;
+fn node_rng(graph: &Graph, node: NodeId) -> Pcg64Mcg {
+    let spice = graph.hash_of(node) as u64;
+    Pcg64Mcg::seed_from_u64(super::hash(spice, SEED))
+}
 
 #[derive(Clone, Copy)]
 struct CarrierSignal {
@@ -232,6 +218,7 @@ static VERTEX_CROSSING_SETS: LazyLock<Vec<SideSet>> = LazyLock::new(|| {
         .collect()
 });
 
+#[cfg(test)]
 fn edge_crossing_sets(eligible_sides: SideSet) -> impl Iterator<Item = SideSet> {
     EDGE_CROSSING_SETS
         .iter()
@@ -239,6 +226,7 @@ fn edge_crossing_sets(eligible_sides: SideSet) -> impl Iterator<Item = SideSet> 
         .filter(move |set| side_set_key(*set) & side_set_key(eligible_sides) == side_set_key(*set))
 }
 
+#[cfg(test)]
 fn vertex_crossing_sets(eligible_sides: SideSet) -> impl Iterator<Item = SideSet> {
     VERTEX_CROSSING_SETS
         .iter()
@@ -246,14 +234,24 @@ fn vertex_crossing_sets(eligible_sides: SideSet) -> impl Iterator<Item = SideSet
         .filter(move |set| side_set_key(*set) & side_set_key(eligible_sides) == side_set_key(*set))
 }
 
-fn edge_propagation_sets(parent_sides: SideSet) -> impl Iterator<Item = SideSet> {
-    edge_crossing_sets(SideSet::ALL_SIDES)
-        .filter(move |target| !destination_crosses_parent_plane(parent_sides, *target))
+fn eligible_destination_sides(
+    parent_sides: SideSet,
+    min_crossings: usize,
+    max_crossings: usize,
+) -> impl Iterator<Item = SideSet> {
+    let plane_sides = bounding_plane_sides(parent_sides);
+    Side::iter()
+        .map(|side| SideSet::from_iter([side]))
+        .chain(EDGE_CROSSING_SETS.iter().copied())
+        .chain(VERTEX_CROSSING_SETS.iter().copied())
+        .filter(move |destination_sides| {
+            (min_crossings..=max_crossings).contains(&destination_sides.len())
+                && destination_sides.intersection(plane_sides).is_empty()
+        })
 }
 
-fn vertex_propagation_sets(parent_sides: SideSet) -> impl Iterator<Item = SideSet> {
-    vertex_crossing_sets(SideSet::ALL_SIDES)
-        .filter(move |target| !destination_crosses_parent_plane(parent_sides, *target))
+fn diagonal_propagation_sets(parent_sides: SideSet) -> impl Iterator<Item = SideSet> {
+    eligible_destination_sides(parent_sides, 2, 3)
 }
 
 /// Face planes that bound propagation for this incoming parent feature.
@@ -268,12 +266,9 @@ fn bounding_plane_sides(parent_sides: SideSet) -> SideSet {
                 .collect()
         }
         2 => {
-            let parents = Side::iter()
-                .filter(|side| parent_sides.contains(*side))
-                .collect::<Vec<_>>();
-            let [first, second] = parents[..] else {
-                unreachable!()
-            };
+            let mut parents = Side::iter().filter(|side| parent_sides.contains(*side));
+            let first = parents.next().expect("two parent sides are present");
+            let second = parents.next().expect("two parent sides are present");
             parent_sides.union(
                 Side::iter()
                     .filter(|side| side.adjacent_to(first) && side.adjacent_to(second))
@@ -287,6 +282,7 @@ fn bounding_plane_sides(parent_sides: SideSet) -> SideSet {
 
 /// Whether the geodesic from this node to the completed destination crosses
 /// any bounding plane for its incoming parent feature.
+#[cfg(test)]
 fn destination_crosses_parent_plane(parent_sides: SideSet, target_sides: SideSet) -> bool {
     let target_center = Side::iter()
         .filter(|side| target_sides.contains(*side))
@@ -295,9 +291,9 @@ fn destination_crosses_parent_plane(parent_sides: SideSet, target_sides: SideSet
             |transform, side| side.reflection_f64() * transform,
         )
         * MPoint::origin();
-
+    let plane_sides = bounding_plane_sides(parent_sides);
     Side::iter()
-        .filter(|side| bounding_plane_sides(parent_sides).contains(*side))
+        .filter(|side| plane_sides.contains(*side))
         .any(|plane_side| {
             // The source center lies on the negative side of each plane. A
             // target on or beyond a plane makes its geodesic intersect it.
@@ -306,8 +302,8 @@ fn destination_crosses_parent_plane(parent_sides: SideSet, target_sides: SideSet
 }
 
 fn propagation_sides(parent_sides: SideSet) -> SideSet {
-    Side::iter()
-        .filter(|side| !destination_crosses_parent_plane(parent_sides, SideSet::from_iter([*side])))
+    eligible_destination_sides(parent_sides, 1, 1)
+        .flat_map(|sides| Side::iter().filter(move |side| sides.contains(*side)))
         .collect()
 }
 
@@ -320,10 +316,9 @@ fn diagonal_propagation_sides(tree_parent_sides: SideSet) -> SideSet {
 /// A node's state is finalized after its graph parents, so new face branches
 /// can only be sent toward graph children.
 fn graph_child_sides(graph_parent_sides: SideSet) -> SideSet {
-    let graph_child_sides = Side::iter()
+    Side::iter()
         .filter(|side| !graph_parent_sides.contains(*side))
-        .collect::<SideSet>();
-    graph_child_sides
+        .collect()
 }
 
 fn incoming_tree_parent_sides(graph: &Graph, node: NodeId) -> SideSet {
@@ -362,19 +357,23 @@ impl MegatreeNode {
         enviro: EnviroFactors,
         tree_parent_sides: SideSet,
         graph_parent_sides: SideSet,
+        rng: &mut Pcg64Mcg,
     ) -> (Option<Self>, Option<(NodeId, SideSet)>) {
-        let spice = graph.hash_of(node) as u64;
-        let mut rng = Pcg64Mcg::seed_from_u64(super::hash(spice, SEED));
         // `Graph::parents` returns every shallower neighbor and the shared side.
         // Parent states have already been finalized by `ensure_node_state`.
-        let face_parent = graph.parents(node).find_map(|(side, parent)| {
-            graph.node_state(parent).megatree.tree.and_then(|state| {
-                state
-                    .child_sides
-                    .contains(side)
-                    .then_some((side, state.remaining_growth))
+        // Prefer the existing face-connected path if it converges with a diagonal signal.
+        // The side key makes selection among multiple face parents construction-order independent.
+        let face_parent = graph
+            .parents(node)
+            .filter_map(|(side, parent)| {
+                graph.node_state(parent).megatree.tree.and_then(|state| {
+                    state
+                        .child_sides
+                        .contains(side)
+                        .then_some((side, state.remaining_growth))
+                })
             })
-        });
+            .min_by_key(|(side, _)| *side as u8);
         let diagonal_parent = graph
             .parents(node)
             .flat_map(|(side, parent)| {
@@ -592,6 +591,7 @@ mod tests {
         parent.child_sides.insert(Side::B);
         graph[NodeId::ROOT].state.as_mut().unwrap().megatree.tree = Some(parent);
         let child = graph.ensure_neighbor(NodeId::ROOT, Side::B);
+        let mut rng = node_rng(&graph, child);
         MegatreeNode::new(
             &graph,
             child,
@@ -599,6 +599,7 @@ mod tests {
             climate(0.0, 10.0),
             SideSet::from_iter([Side::B]),
             SideSet::from_iter([Side::B]),
+            &mut rng,
         )
         .0
         .unwrap()
@@ -649,8 +650,7 @@ mod tests {
         let (graph, target) = graph_with_edge_carriers([Side::A, Side::B]);
         let state = MegatreeState::new(&graph, target, NodeStateKind::Sky, climate(100.0, 10.0));
         let tree = state.tree.unwrap();
-        let mut rng =
-            Pcg64Mcg::seed_from_u64(super::super::hash(graph.hash_of(target) as u64, SEED));
+        let mut rng = node_rng(&graph, target);
         let expected_growth =
             6.5 - 1.0 + rng.sample(Normal::new(0.0, GROWTH_COST_STANDARD_DEVIATION).unwrap());
         assert_eq!(tree.remaining_growth, expected_growth);
@@ -733,6 +733,39 @@ mod tests {
         let tree = state.tree.unwrap();
         assert_eq!(tree.remaining_growth, INITIAL_REMAINING_GROWTH);
         assert_eq!(state.diagonal.as_ref().unwrap().segments.len(), 1);
+    }
+
+    #[test]
+    fn face_parent_precedence_is_stable_when_diagonal_signals_converge() {
+        // Existing face routes win convergence, and the lowest side selects consistently.
+        let mut results = Vec::new();
+        for order in [[Side::A, Side::B], [Side::B, Side::A]] {
+            let (graph, target) = graph_with_face_and_diagonal_parents(order);
+            let tree_parent_sides = incoming_tree_parent_sides(&graph, target);
+            let state =
+                MegatreeState::new(&graph, target, NodeStateKind::DeepSky, climate(100.0, 10.0));
+            let tree = state.tree.unwrap();
+            assert_eq!(tree.parent_side, Some(Side::A));
+
+            let mut expected_rng = node_rng(&graph, target);
+            let expected_growth = 2.5 - 1.0
+                + expected_rng.sample(Normal::new(0.0, GROWTH_COST_STANDARD_DEVIATION).unwrap());
+            assert_eq!(tree.remaining_growth, expected_growth);
+            let expected_diagonal_branches = diagonal_propagation_sets(tree_parent_sides).count();
+            assert_eq!(
+                state.diagonal.as_ref().unwrap().segments.len(),
+                expected_diagonal_branches,
+                "the convergent diagonal arrival must not be rasterized a second time"
+            );
+            results.push((
+                tree.parent_side,
+                tree.child_sides,
+                tree.remaining_growth,
+                expected_diagonal_branches,
+            ));
+        }
+
+        assert_eq!(results[0], results[1]);
     }
 
     #[test]
@@ -837,8 +870,7 @@ mod tests {
         let target_kind = graph_a.node_state(target_a).kind;
         let expected_growth = if matches!(target_kind, NodeStateKind::Sky | NodeStateKind::DeepSky)
         {
-            let mut rng =
-                Pcg64Mcg::seed_from_u64(super::super::hash(graph_a.hash_of(target_a) as u64, SEED));
+            let mut rng = node_rng(&graph_a, target_a);
             INITIAL_REMAINING_GROWTH - 1.0
                 + rng.sample(Normal::new(0.0, GROWTH_COST_STANDARD_DEVIATION).unwrap())
         } else {
@@ -865,9 +897,603 @@ mod tests {
     }
 
     #[test]
+    fn edge_and_vertex_crossing_sets_are_unique_honeycomb_features() {
+        // Candidate sets come directly from side adjacency and canonical vertices.
+        let edges = edge_crossing_sets(SideSet::ALL_SIDES).collect::<Vec<_>>();
+        let vertices = vertex_crossing_sets(SideSet::ALL_SIDES).collect::<Vec<_>>();
+        assert_eq!(edges.len(), 30);
+        assert_eq!(
+            edges.iter().collect::<std::collections::HashSet<_>>().len(),
+            30
+        );
+        assert!(edges.iter().all(|set| set.len() == 2));
+        assert!(edges.iter().all(|set| {
+            let sides = Side::iter()
+                .filter(|side| set.contains(*side))
+                .collect::<Vec<_>>();
+            sides[0].adjacent_to(sides[1])
+        }));
+        assert_eq!(vertices.len(), Vertex::VALUES.len());
+        assert_eq!(
+            vertices
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            Vertex::VALUES.len()
+        );
+        assert!(vertices.iter().all(|set| set.len() == 3));
+        for opposite_face in Side::iter() {
+            let edge_targets = edges
+                .iter()
+                .filter(|set| set.contains(opposite_face))
+                .collect::<Vec<_>>();
+            let vertex_targets = vertices
+                .iter()
+                .filter(|set| set.contains(opposite_face))
+                .collect::<Vec<_>>();
+            assert_eq!(edge_targets.len(), 5);
+            assert_eq!(vertex_targets.len(), 5);
+            assert!(edge_targets.iter().all(|set| {
+                Side::iter()
+                    .filter(|side| set.contains(*side) && *side != opposite_face)
+                    .all(|side| side.adjacent_to(opposite_face))
+            }));
+        }
+
+        let mut graph = Graph::new(1);
+        let edge_destinations = edges
+            .iter()
+            .map(|set| destination_for(&mut graph, *set))
+            .collect::<std::collections::HashSet<_>>();
+        let vertex_destinations = vertices
+            .iter()
+            .map(|set| destination_for(&mut graph, *set))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(edge_destinations.len(), edges.len());
+        assert_eq!(vertex_destinations.len(), vertices.len());
+        assert!(edge_destinations.is_disjoint(&vertex_destinations));
+        for target_sides in edges.iter().chain(&vertices) {
+            let target = destination_for(&mut graph, *target_sides);
+            let parents = graph.parents(target).collect::<Vec<_>>();
+            assert_eq!(parents.len(), target_sides.len());
+            for side in Side::iter().filter(|side| target_sides.contains(*side)) {
+                let predecessor_sides = Side::iter()
+                    .filter(|candidate| target_sides.contains(*candidate) && *candidate != side)
+                    .collect::<SideSet>();
+                let predecessor = destination_for(&mut graph, predecessor_sides);
+                assert!(parents.contains(&(side, predecessor)));
+            }
+        }
+    }
+
+    #[test]
+    fn one_parent_plane_forbids_geodesics_crossing_its_pentagonal_boundary() {
+        // The parent face and its five adjacent face planes form the forbidden
+        // pentagonal boundary for completed face, edge, and vertex exits.
+        let parents = SideSet::from_iter([Side::A]);
+        let eligible = propagation_sides(parents);
+
+        assert_eq!(eligible.len(), 6);
+        assert!(Side::iter().all(|side| {
+            eligible.contains(side) == (side != Side::A && !side.adjacent_to(Side::A))
+        }));
+        assert_eq!(outgoing_crossing_sets(parents).len(), 21);
+    }
+
+    #[test]
+    fn two_parent_planes_forbid_exits_crossing_their_shared_edge_boundary() {
+        // The two parent faces and the two faces at their common edge bound exits.
+        let parents = SideSet::from_iter([Side::A, Side::B]);
+        let eligible = propagation_sides(parents);
+
+        assert_eq!(eligible.len(), 8);
+        let corner_sides = Side::iter()
+            .filter(|side| {
+                !parents.contains(*side) && side.adjacent_to(Side::A) && side.adjacent_to(Side::B)
+            })
+            .collect::<SideSet>();
+        assert_eq!(corner_sides.len(), 2);
+        assert!(
+            Side::iter()
+                .filter(|side| corner_sides.contains(*side))
+                .all(|side| !eligible.contains(side))
+        );
+        assert!(Side::iter().all(|side| {
+            eligible.contains(side)
+                != destination_crosses_parent_plane(parents, SideSet::from_iter([side]))
+        }));
+
+        assert_eq!(outgoing_crossing_sets(parents).len(), 31);
+    }
+
+    #[test]
+    fn three_parent_planes_are_checked_independently() {
+        // An exit is forbidden if its geodesic crosses any one of the three planes.
+        let parents = SideSet::from_iter(Vertex::A.canonical_sides());
+        let eligible = propagation_sides(parents);
+
+        assert_eq!(eligible.len(), 9);
+        assert!(Side::iter().all(|side| {
+            eligible.contains(side)
+                != destination_crosses_parent_plane(parents, SideSet::from_iter([side]))
+        }));
+        assert_eq!(outgoing_crossing_sets(parents).len(), 37);
+    }
+
+    #[test]
+    fn propagation_rule_is_equivariant_under_every_dodecahedral_symmetry() {
+        // Enumerate every automorphism of the dodecahedron's face-adjacency graph.
+        // For every face, edge, and vertex parent feature, the complete outgoing
+        // face/edge/vertex set must transform with it, including its stabilizer.
+        let symmetries = side_adjacency_automorphisms();
+        assert_eq!(symmetries.len(), 120);
+
+        let parent_features = Side::iter()
+            .map(|side| SideSet::from_iter([side]))
+            .chain(EDGE_CROSSING_SETS.iter().copied())
+            .chain(VERTEX_CROSSING_SETS.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(parent_features.len(), 12 + 30 + 20);
+
+        for parents in parent_features {
+            let outgoing = outgoing_crossing_sets(parents);
+            let counts = crossing_counts(&outgoing);
+            let total_counts = [12, 30, 20];
+            let forbidden_counts: [usize; 3] =
+                std::array::from_fn(|index| total_counts[index] - counts[index]);
+            let expected_forbidden_counts = match parents.len() {
+                1 => [6, 20, 15],
+                2 => [4, 15, 12],
+                3 => [3, 12, 10],
+                _ => unreachable!(),
+            };
+            assert_eq!(forbidden_counts, expected_forbidden_counts);
+
+            for symmetry in &symmetries {
+                let transformed_parents = transform_side_set(parents, symmetry);
+                let transformed_outgoing = outgoing_crossing_sets(transformed_parents)
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>();
+                let expected_outgoing = outgoing
+                    .iter()
+                    .map(|set| transform_side_set(*set, symmetry))
+                    .collect::<std::collections::HashSet<_>>();
+                assert_eq!(
+                    transformed_outgoing, expected_outgoing,
+                    "crossing feature set is not equivariant for {parents:?} under {symmetry:?}"
+                );
+
+                if transformed_parents == parents {
+                    assert_eq!(transformed_outgoing, outgoing.iter().copied().collect());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combinatorial_destination_eligibility_matches_geometric_reference() {
+        // Compare the side-set rule against geodesic plane tests for every face,
+        // edge, and vertex parent/destination pair.
+        let features = Side::iter()
+            .map(|side| SideSet::from_iter([side]))
+            .chain(EDGE_CROSSING_SETS.iter().copied())
+            .chain(VERTEX_CROSSING_SETS.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(features.len(), 62);
+
+        for parent_sides in &features {
+            let plane_sides = bounding_plane_sides(*parent_sides);
+            for destination_sides in &features {
+                let uncached_center = Side::iter()
+                    .filter(|side| destination_sides.contains(*side))
+                    .fold(
+                        crate::math::MIsometry::<f64>::identity(),
+                        |transform, side| side.reflection_f64() * transform,
+                    )
+                    * MPoint::origin();
+                let uncached_crosses =
+                    Side::iter()
+                        .filter(|side| plane_sides.contains(*side))
+                        .any(|plane_side| {
+                            plane_side.normal_f64().as_ref().mip(&uncached_center) >= -1.0e-10
+                        });
+                let combinatorial_crosses = !destination_sides.intersection(plane_sides).is_empty();
+
+                assert_eq!(
+                    combinatorial_crosses, uncached_crosses,
+                    "combinatorial eligibility differs for parents {parent_sides:?} and destination {destination_sides:?}"
+                );
+            }
+        }
+    }
+
+    fn outgoing_crossing_sets(parents: SideSet) -> Vec<SideSet> {
+        Side::iter()
+            .filter(|side| !destination_crosses_parent_plane(parents, SideSet::from_iter([*side])))
+            .map(|side| SideSet::from_iter([side]))
+            .chain(
+                edge_crossing_sets(SideSet::ALL_SIDES)
+                    .filter(|set| !destination_crosses_parent_plane(parents, *set)),
+            )
+            .chain(
+                vertex_crossing_sets(SideSet::ALL_SIDES)
+                    .filter(|set| !destination_crosses_parent_plane(parents, *set)),
+            )
+            .collect()
+    }
+
+    fn crossing_counts(crossings: &[SideSet]) -> [usize; 3] {
+        let mut counts = [0; 3];
+        for crossing in crossings {
+            counts[crossing.len() - 1] += 1;
+        }
+        counts
+    }
+
+    fn transform_side_set(sides: SideSet, symmetry: &[Side; Side::VALUES.len()]) -> SideSet {
+        Side::iter()
+            .filter(|side| sides.contains(*side))
+            .map(|side| symmetry[side as usize])
+            .collect()
+    }
+
+    fn side_adjacency_automorphisms() -> Vec<[Side; Side::VALUES.len()]> {
+        fn extend(
+            mapping: &mut [Option<Side>; Side::VALUES.len()],
+            used: u16,
+            result: &mut Vec<[Side; Side::VALUES.len()]>,
+        ) {
+            let next_source = Side::iter()
+                .filter(|side| mapping[*side as usize].is_none())
+                .max_by_key(|side| {
+                    Side::iter()
+                        .filter(|other| {
+                            mapping[*other as usize].is_some() && side.adjacent_to(*other)
+                        })
+                        .count()
+                });
+            let Some(source) = next_source else {
+                result.push(mapping.map(Option::unwrap));
+                return;
+            };
+
+            for candidate in Side::iter().filter(|side| used & (1 << (*side as u8)) == 0) {
+                let preserves_adjacency = Side::iter()
+                    .filter_map(|other| mapping[other as usize].map(|mapped| (other, mapped)))
+                    .all(|(other, mapped)| {
+                        source.adjacent_to(other) == candidate.adjacent_to(mapped)
+                    });
+                if preserves_adjacency {
+                    mapping[source as usize] = Some(candidate);
+                    extend(mapping, used | (1 << (candidate as u8)), result);
+                    mapping[source as usize] = None;
+                }
+            }
+        }
+
+        let mut result = Vec::new();
+        extend(&mut [None; Side::VALUES.len()], 0, &mut result);
+        result
+    }
+
+    #[test]
+    fn propagation_covers_each_unblocked_descender_once() {
+        // Face, edge, and vertex routes cover every unblocked graph descender once.
+        let parent_sets = [
+            SideSet::from_iter([Side::A]),
+            SideSet::from_iter([Side::A, Side::B]),
+            SideSet::from_iter(Vertex::A.canonical_sides()),
+        ];
+
+        for tree_parent_sides in parent_sets {
+            let mut graph = Graph::new(1);
+            let node = target_from(&mut graph, NodeId::ROOT, tree_parent_sides);
+            let graph_parent_sides = graph
+                .parents(node)
+                .map(|(side, _)| side)
+                .collect::<SideSet>();
+            assert_eq!(graph_parent_sides, tree_parent_sides);
+
+            let source_depth = graph.depth(node);
+            let mut expected = std::collections::HashSet::new();
+            let mut propagated = std::collections::HashSet::new();
+            let mut expected_by_feature = [0; 4];
+
+            for feature in outgoing_crossing_sets(tree_parent_sides) {
+                let target = target_from(&mut graph, node, feature);
+                if graph.depth(target) > source_depth
+                    && feature.intersection(graph_parent_sides).is_empty()
+                {
+                    assert!(
+                        expected.insert(target),
+                        "distinct unblocked features must not reach the same node"
+                    );
+                    expected_by_feature[feature.len()] += 1;
+                }
+
+                if feature.intersection(graph_parent_sides).is_empty() {
+                    assert!(graph.depth(target) > source_depth);
+                    assert!(
+                        propagated.insert(target),
+                        "distinct face/edge/corner features must not overlap"
+                    );
+                }
+            }
+
+            assert_eq!(propagated, expected);
+            let expected_counts = match tree_parent_sides.len() {
+                1 => [0, 6, 10, 5],
+                2 => [0, 8, 15, 8],
+                3 => [0, 9, 18, 10],
+                _ => unreachable!(),
+            };
+            assert_eq!(expected_by_feature, expected_counts);
+        }
+    }
+
+    #[test]
+    fn face_branches_reach_all_unblocked_graph_children_without_parent_overlap() {
+        // Face branches use tree parents for adjacency and graph parents only to
+        // distinguish descenders from already-finalized ancestors.
+        let cfg = WorldgenConfig::default();
+        let mut graph = Graph::new(1);
+        let first = graph.ensure_neighbor(NodeId::ROOT, Side::A);
+        let second = graph.ensure_neighbor(NodeId::ROOT, Side::B);
+        let node = graph.ensure_neighbor(first, Side::B);
+        assert_eq!(node, graph.ensure_neighbor(second, Side::A));
+
+        let parents = graph.parents(node).collect::<Vec<_>>();
+        for (_, parent) in &parents {
+            graph.ensure_node_state(*parent, &cfg);
+            graph[*parent].state.as_mut().unwrap().megatree.tree = None;
+        }
+        let (tree_parent_side, tree_parent) = parents[0];
+        graph[tree_parent].state.as_mut().unwrap().megatree.tree = Some(MegatreeNode {
+            parent_side: None,
+            child_sides: SideSet::from_iter([tree_parent_side]),
+            remaining_growth: INITIAL_REMAINING_GROWTH,
+        });
+
+        let tree_parent_sides = SideSet::from_iter([tree_parent_side]);
+        let graph_parent_sides = parents.iter().map(|(side, _)| *side).collect();
+        let mut rng = node_rng(&graph, node);
+        let tree = MegatreeNode::new(
+            &graph,
+            node,
+            NodeStateKind::DeepSky,
+            climate(100.0, 10.0),
+            tree_parent_sides,
+            graph_parent_sides,
+            &mut rng,
+        )
+        .0
+        .unwrap();
+
+        assert_eq!(
+            tree.child_sides,
+            diagonal_propagation_sides(tree_parent_sides)
+                .intersection(graph_child_sides(graph_parent_sides))
+        );
+        assert!(
+            Side::iter()
+                .filter(|side| tree.child_sides.contains(*side))
+                .all(|side| !graph_parent_sides.contains(side))
+        );
+    }
+
+    #[test]
+    fn unrelated_graph_parents_do_not_restrict_tree_exits() {
+        // A graph parent without an outgoing tree signal does not reduce the six exits.
+        let (mut graph, target) = graph_with_edge_carriers([Side::A, Side::B]);
+        let parents = graph.parents(target).collect::<Vec<_>>();
+        assert_eq!(parents.len(), 2);
+
+        let (active_side, _) = parents[0];
+        let (inactive_side, inactive_parent) = parents[1];
+        graph[inactive_parent]
+            .state
+            .as_mut()
+            .unwrap()
+            .megatree
+            .diagonal
+            .as_mut()
+            .unwrap()
+            .outgoing
+            .retain(|(side, _)| *side != inactive_side);
+
+        let incoming_sides = incoming_tree_parent_sides(&graph, target);
+        assert_eq!(incoming_sides, SideSet::from_iter([active_side]));
+        assert_eq!(propagation_sides(incoming_sides).len(), 6);
+    }
+
+    #[test]
+    fn diagonal_carrier_parents_all_restrict_tree_exits() {
+        // Every carrier carrying an incoming diagonal branch contributes a parent side.
+        let (graph, target) = graph_with_edge_carriers([Side::A, Side::B]);
+        let incoming_sides = incoming_tree_parent_sides(&graph, target);
+
+        assert_eq!(incoming_sides.len(), 2);
+        assert_eq!(
+            incoming_sides,
+            graph
+                .parents(target)
+                .map(|(side, _)| side)
+                .collect::<SideSet>()
+        );
+        assert_eq!(propagation_sides(incoming_sides).len(), 8);
+    }
+
+    fn graph_with_edge_carriers(order: [Side; 2]) -> (Graph, NodeId) {
+        let cfg = WorldgenConfig::default();
+        let mut graph = Graph::new(1);
+        graph.ensure_node_state(NodeId::ROOT, &cfg);
+        graph[NodeId::ROOT].state.as_mut().unwrap().megatree.tree = None;
+        let target_sides = SideSet::from_iter(order);
+        for side in order {
+            graph[NodeId::ROOT]
+                .state
+                .as_mut()
+                .unwrap()
+                .megatree
+                .diagonal
+                .get_or_insert_with(|| Box::new(DiagonalState::default()))
+                .outgoing
+                .push((
+                    side,
+                    CarrierSignal {
+                        source: NodeId::ROOT,
+                        target_sides,
+                        crossed_sides: SideSet::from_iter([side]),
+                        remaining_growth: INITIAL_REMAINING_GROWTH,
+                    },
+                ));
+        }
+        let first = graph.ensure_neighbor(NodeId::ROOT, order[0]);
+        let second = graph.ensure_neighbor(NodeId::ROOT, order[1]);
+        let target = graph.ensure_neighbor(first, order[1]);
+        assert_eq!(target, graph.ensure_neighbor(second, order[0]));
+        graph.ensure_node_state(first, &cfg);
+        graph.ensure_node_state(second, &cfg);
+        for carrier in [first, second] {
+            graph[carrier].state.as_mut().unwrap().megatree.tree = None;
+        }
+        (graph, target)
+    }
+
+    fn graph_with_face_and_diagonal_parents(order: [Side; 2]) -> (Graph, NodeId) {
+        let cfg = WorldgenConfig::default();
+        let mut graph = Graph::new(1);
+        graph.ensure_node_state(NodeId::ROOT, &cfg);
+        graph[NodeId::ROOT].state.as_mut().unwrap().megatree.tree = None;
+
+        let first = graph.ensure_neighbor(NodeId::ROOT, order[0]);
+        let second = graph.ensure_neighbor(NodeId::ROOT, order[1]);
+        let target = graph.ensure_neighbor(first, order[1]);
+        assert_eq!(target, graph.ensure_neighbor(second, order[0]));
+
+        let parents = graph.parents(target).collect::<Vec<_>>();
+        for (_, parent) in &parents {
+            graph.ensure_node_state(*parent, &cfg);
+        }
+        for (side, parent) in &parents {
+            let megatree = &mut graph[*parent].state.as_mut().unwrap().megatree;
+            megatree.diagonal = None;
+            megatree.tree = Some(MegatreeNode {
+                parent_side: None,
+                child_sides: SideSet::from_iter([*side]),
+                remaining_growth: if *side == Side::A { 2.5 } else { 7.5 },
+            });
+        }
+
+        let (diagonal_side, diagonal_parent) = parents
+            .iter()
+            .find(|(side, _)| *side == Side::B)
+            .copied()
+            .unwrap();
+        graph[diagonal_parent]
+            .state
+            .as_mut()
+            .unwrap()
+            .megatree
+            .diagonal
+            .get_or_insert_with(|| Box::new(DiagonalState::default()))
+            .outgoing
+            .push((
+                diagonal_side,
+                CarrierSignal {
+                    source: NodeId::ROOT,
+                    target_sides: SideSet::from_iter([Side::A, Side::B]),
+                    crossed_sides: SideSet::from_iter([Side::A, Side::B]),
+                    remaining_growth: 20.0,
+                },
+            ));
+
+        (graph, target)
+    }
+
+    fn destination_for(graph: &mut Graph, sides: SideSet) -> NodeId {
+        target_from(graph, NodeId::ROOT, sides)
+    }
+
+    fn target_from(graph: &mut Graph, start: NodeId, sides: SideSet) -> NodeId {
+        Side::iter()
+            .filter(|side| sides.contains(*side))
+            .fold(start, |node, side| graph.ensure_neighbor(node, side))
+    }
+
+    fn graph_with_vertex_carriers(reverse_order: bool) -> (Graph, NodeId) {
+        let cfg = WorldgenConfig::default();
+        let mut graph = Graph::new(1);
+        graph.ensure_node_state(NodeId::ROOT, &cfg);
+        graph[NodeId::ROOT].state.as_mut().unwrap().megatree.tree = None;
+        let target_sides = SideSet::from_iter(Vertex::A.canonical_sides());
+        for side in Side::iter().filter(|side| target_sides.contains(*side)) {
+            graph[NodeId::ROOT]
+                .state
+                .as_mut()
+                .unwrap()
+                .megatree
+                .diagonal
+                .get_or_insert_with(|| Box::new(DiagonalState::default()))
+                .outgoing
+                .push((
+                    side,
+                    CarrierSignal {
+                        source: NodeId::ROOT,
+                        target_sides,
+                        crossed_sides: SideSet::from_iter([side]),
+                        remaining_growth: INITIAL_REMAINING_GROWTH,
+                    },
+                ));
+        }
+
+        let [a, b, c] = Vertex::A.canonical_sides();
+        let mut permutations = vec![
+            [a, b, c],
+            [a, c, b],
+            [b, a, c],
+            [b, c, a],
+            [c, a, b],
+            [c, b, a],
+        ];
+        if reverse_order {
+            permutations.reverse();
+        }
+        let mut target = None;
+        for [first, second, third] in permutations {
+            let first_node = graph.ensure_neighbor(NodeId::ROOT, first);
+            let second_node = graph.ensure_neighbor(first_node, second);
+            let candidate = graph.ensure_neighbor(second_node, third);
+            assert!(target.is_none_or(|target| target == candidate));
+            target = Some(candidate);
+        }
+        let target = target.unwrap();
+        let mut carrier_nodes = graph
+            .parents(target)
+            .map(|(_, parent)| parent)
+            .collect::<Vec<_>>();
+        if reverse_order {
+            carrier_nodes.reverse();
+        }
+        for carrier in carrier_nodes {
+            graph.ensure_node_state(carrier, &cfg);
+        }
+        graph.ensure_node_state(target, &cfg);
+        for carrier in graph
+            .parents(target)
+            .map(|(_, parent)| parent)
+            .collect::<Vec<_>>()
+        {
+            graph[carrier].state.as_mut().unwrap().megatree.tree = None;
+        }
+        (graph, target)
+    }
+
+    #[test]
     fn land_seed_uses_side_a_as_ground_axis() {
         // A newly seeded Land tree begins along the ground-plane axis and its opposite face.
         let graph = Graph::new(1);
+        let mut rng = node_rng(&graph, NodeId::ROOT);
         let tree = MegatreeNode::new(
             &graph,
             NodeId::ROOT,
@@ -875,6 +1501,7 @@ mod tests {
             climate(100.0, 10.0),
             SideSet::EMPTY,
             SideSet::EMPTY,
+            &mut rng,
         )
         .0
         .unwrap();
