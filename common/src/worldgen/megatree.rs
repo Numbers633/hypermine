@@ -36,6 +36,8 @@ struct DiagonalState {
     has_children: bool,
 }
 
+type SignalKey = (NodeId, u16, u16);
+
 impl MegatreeState {
     pub fn new(graph: &Graph, node: NodeId, kind: NodeStateKind, enviro: EnviroFactors) -> Self {
         let mut rng = node_rng(graph, node);
@@ -47,66 +49,18 @@ impl MegatreeState {
         let (tree, parent_signal) =
             MegatreeNode::new(graph, node, kind, enviro, parent_sides, &incoming, &mut rng);
         let parent_signal_key = parent_signal.map(CarrierSignal::key);
-
-        let mut segments = incoming
-            .iter()
-            .filter(|signal| !signal.is_complete() || parent_signal_key == Some(signal.key()))
-            .map(|signal| signal.segment())
-            .collect::<Vec<_>>();
-        let mut outgoing = Vec::new();
-        for signal in incoming
-            .iter()
-            .copied()
-            .filter(|signal| !signal.is_complete())
-        {
-            for side in Side::iter().filter(|side| signal.remaining_sides.contains(*side)) {
-                if !parent_sides.graph.contains(side) {
-                    push_unique_outgoing(&mut outgoing, side, signal.cross(side));
-                }
-            }
-        }
-
-        let mut has_children = false;
-        if let Some(tree_node) = tree
-            && matches!(kind, NodeStateKind::Sky | NodeStateKind::DeepSky)
-            && tree_node.remaining_growth >= 0.0
-        {
-            for target_sides in diagonal_destinations(parent_sides.tree) {
-                let routes = Side::iter()
-                    .filter(|side| {
-                        target_sides.contains(*side) && !parent_sides.graph.contains(*side)
-                    })
-                    .collect::<SideSet>();
-                // Keep one roll per geometric destination, even if graph routing blocks it.
-                let propagates = rng.random::<f32>() < branch_probability(enviro);
-                if routes.is_empty() || !propagates {
-                    continue;
-                }
-
-                has_children = true;
-                let signal = CarrierSignal {
-                    source: node,
-                    target_sides,
-                    remaining_sides: target_sides,
-                };
-                segments.push(signal.segment());
-                for side in Side::iter().filter(|side| routes.contains(*side)) {
-                    push_unique_outgoing(&mut outgoing, side, signal.cross(side));
-                }
-            }
-        }
+        let mut diagonal = forward_carriers(&incoming, parent_signal_key, parent_sides.graph);
+        let new_branches =
+            generate_diagonal_branches(node, tree, kind, enviro, parent_sides, &mut rng);
+        diagonal.outgoing.extend(new_branches.outgoing);
+        diagonal.segments.extend(new_branches.segments);
+        diagonal.has_children = new_branches.has_children;
 
         let diagonal = (parent_signal.is_some()
-            || !outgoing.is_empty()
-            || !segments.is_empty()
-            || has_children)
-            .then(|| {
-                Box::new(DiagonalState {
-                    outgoing,
-                    segments,
-                    has_children,
-                })
-            });
+            || !diagonal.outgoing.is_empty()
+            || !diagonal.segments.is_empty()
+            || diagonal.has_children)
+            .then(|| Box::new(diagonal));
         Self { tree, diagonal }
     }
 
@@ -117,6 +71,77 @@ impl MegatreeState {
     }
 }
 
+fn forward_carriers(
+    incoming: &[CarrierSignal],
+    parent_signal: Option<SignalKey>,
+    graph_parent_sides: SideSet,
+) -> DiagonalState {
+    let mut state = DiagonalState {
+        outgoing: Vec::new(),
+        segments: incoming
+            .iter()
+            .filter(|signal| !signal.is_complete() || parent_signal == Some(signal.key()))
+            .map(|signal| signal.segment())
+            .collect(),
+        has_children: false,
+    };
+
+    for signal in incoming
+        .iter()
+        .copied()
+        .filter(|signal| !signal.is_complete())
+    {
+        for side in Side::iter().filter(|side| signal.remaining_sides.contains(*side)) {
+            if !graph_parent_sides.contains(side) {
+                push_unique_outgoing(&mut state.outgoing, side, signal.cross(side));
+            }
+        }
+    }
+    state
+}
+
+fn generate_diagonal_branches(
+    node: NodeId,
+    tree: Option<MegatreeNode>,
+    kind: NodeStateKind,
+    enviro: EnviroFactors,
+    parent_sides: ParentSides,
+    rng: &mut Pcg64Mcg,
+) -> DiagonalState {
+    let mut state = DiagonalState {
+        outgoing: Vec::new(),
+        segments: Vec::new(),
+        has_children: false,
+    };
+    if let Some(tree_node) = tree
+        && matches!(kind, NodeStateKind::Sky | NodeStateKind::DeepSky)
+        && tree_node.remaining_growth >= 0.0
+    {
+        for target_sides in diagonal_destinations(parent_sides.tree) {
+            let routes = Side::iter()
+                .filter(|side| target_sides.contains(*side) && !parent_sides.graph.contains(*side))
+                .collect::<SideSet>();
+            // Keep one roll per geometric destination, even if graph routing blocks it.
+            let propagates = rng.random::<f32>() < branch_probability(enviro);
+            if routes.is_empty() || !propagates {
+                continue;
+            }
+
+            state.has_children = true;
+            let signal = CarrierSignal {
+                source: node,
+                target_sides,
+                remaining_sides: target_sides,
+            };
+            state.segments.push(signal.segment());
+            for side in Side::iter().filter(|side| routes.contains(*side)) {
+                push_unique_outgoing(&mut state.outgoing, side, signal.cross(side));
+            }
+        }
+    }
+    state
+}
+
 fn node_rng(graph: &Graph, node: NodeId) -> Pcg64Mcg {
     let spice = graph.hash_of(node) as u64;
     Pcg64Mcg::seed_from_u64(super::hash(spice, SEED))
@@ -124,9 +149,12 @@ fn node_rng(graph: &Graph, node: NodeId) -> Pcg64Mcg {
 
 #[derive(Clone, Copy)]
 struct CarrierSignal {
-    // The source keeps distinct branches separate and holds the unchanged growth budget.
+    /// The source keeps branches distinct and retains the growth budget used at completion.
+    ///
+    /// Carrier routing only follows graph children, so the source state is finalized before
+    /// every carrier and remains available and unchanged when the destination is generated.
     source: NodeId,
-    // Canonical crossing set and the subset still to traverse.
+    /// Canonical crossing set and the subset still to traverse.
     target_sides: SideSet,
     remaining_sides: SideSet,
 }
@@ -147,7 +175,7 @@ impl CarrierSignal {
             .collect()
     }
 
-    fn key(self) -> (NodeId, u16, u16) {
+    fn key(self) -> SignalKey {
         (
             self.source,
             side_set_key(self.target_sides),
@@ -348,6 +376,7 @@ impl MegatreeNode {
                 })
             })
             .min_by_key(|(side, _)| *side as u8);
+        // Prefer the existing face path; stable keys resolve multiple incoming paths predictably.
         let diagonal_parent = incoming
             .iter()
             .copied()
@@ -971,13 +1000,7 @@ mod tests {
         }
         let target = paths[0].last().copied().unwrap();
         assert!(paths.iter().all(|path| path.last() == Some(&target)));
-
-        let mut all_nodes = paths.iter().flatten().copied().collect::<Vec<_>>();
-        all_nodes.sort_by_key(|node| (graph.depth(*node), *node));
-        all_nodes.dedup();
-        for node in all_nodes {
-            graph.ensure_node_state(node, &cfg);
-        }
+        graph.ensure_node_state(source, &cfg);
 
         // Seed one canonical carrier route directly so face propagation cannot mask its convergence.
         graph[source].state.as_mut().unwrap().megatree = MegatreeState {
@@ -1014,6 +1037,7 @@ mod tests {
         intermediate.dedup();
         // Finalize carrier states in graph-depth order after varying insertion order above.
         for node in intermediate {
+            graph.ensure_node_state(node, &cfg);
             let state =
                 MegatreeState::new(&graph, node, NodeStateKind::DeepSky, climate(0.0, -10.0));
             graph[node].state.as_mut().unwrap().megatree = state;
