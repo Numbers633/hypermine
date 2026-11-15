@@ -27,10 +27,14 @@ const SEED: u64 = 13334231312061724180;
 /// Megatree state for one graph node.
 pub struct MegatreeState {
     tree: Option<MegatreeNode>,
-    diagonal: Option<Box<DiagonalState>>,
+    diagonal: Option<Box<CarrierState>>,
 }
 
-struct DiagonalState {
+/// Per-node state aggregating diagonal carriers, separate from any tree node they may create.
+///
+/// `outgoing` relays signals onward, `segments` renders the line through this node, and
+/// `has_children` marks branches originated here rather than signals merely passing through.
+struct CarrierState {
     outgoing: Vec<(Side, CarrierSignal)>,
     segments: Vec<LineSegment>,
     has_children: bool,
@@ -40,6 +44,7 @@ type SignalKey = (NodeId, u16, u16);
 
 impl MegatreeState {
     pub fn new(graph: &Graph, node: NodeId, kind: NodeStateKind, enviro: EnviroFactors) -> Self {
+        // Seed, growth, and branch rolls are node-local and independent of graph expansion order.
         let mut rng = node_rng(graph, node);
         let parent_sides = ParentSides {
             graph: graph.parents(node).map(|(side, _)| side).collect(),
@@ -71,12 +76,16 @@ impl MegatreeState {
     }
 }
 
+/// Renders incoming carrier segments and relays unfinished signals through graph-child sides.
+///
+/// A completed signal is rendered only when selected as this node's parent; relaying never creates
+/// a tree node or consumes growth.
 fn forward_carriers(
     incoming: &[CarrierSignal],
     parent_signal: Option<SignalKey>,
     graph_parent_sides: SideSet,
-) -> DiagonalState {
-    let mut state = DiagonalState {
+) -> CarrierState {
+    let mut state = CarrierState {
         outgoing: Vec::new(),
         segments: incoming
             .iter()
@@ -107,8 +116,8 @@ fn generate_diagonal_branches(
     enviro: EnviroFactors,
     parent_sides: ParentSides,
     rng: &mut Pcg64Mcg,
-) -> DiagonalState {
-    let mut state = DiagonalState {
+) -> CarrierState {
+    let mut state = CarrierState {
         outgoing: Vec::new(),
         segments: Vec::new(),
         has_children: false,
@@ -830,7 +839,7 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .megatree
-                .diagonal = Some(Box::new(DiagonalState {
+                .diagonal = Some(Box::new(CarrierState {
                 outgoing: vec![(
                     diagonal_side,
                     CarrierSignal {
@@ -1009,7 +1018,7 @@ mod tests {
                 child_sides: SideSet::EMPTY,
                 remaining_growth: INITIAL_REMAINING_GROWTH,
             }),
-            diagonal: Some(Box::new(DiagonalState {
+            diagonal: Some(Box::new(CarrierState {
                 outgoing: Side::iter()
                     .filter(|side| target_sides.contains(*side))
                     .map(|side| {
