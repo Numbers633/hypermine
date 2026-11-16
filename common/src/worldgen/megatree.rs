@@ -46,13 +46,27 @@ impl MegatreeState {
     pub fn new(graph: &Graph, node: NodeId, kind: NodeStateKind, enviro: EnviroFactors) -> Self {
         // Seed, growth, and branch rolls are node-local and independent of graph expansion order.
         let mut rng = node_rng(graph, node);
-        let parent_sides = ParentSides {
-            graph: graph.parents(node).map(|(side, _)| side).collect(),
-            tree: incoming_tree_parent_sides(graph, node),
-        };
+        let graph_parent_sides = graph.parents(node).map(|(side, _)| side).collect();
         let incoming = incoming_signals(graph, node);
-        let (tree, parent_signal) =
-            MegatreeNode::new(graph, node, kind, enviro, parent_sides, &incoming, &mut rng);
+        let (tree, parent_signal) = MegatreeNode::new(
+            graph,
+            node,
+            kind,
+            enviro,
+            graph_parent_sides,
+            &incoming,
+            &mut rng,
+        );
+        let tree_parent_sides = parent_signal
+            .map(|signal| signal.target_sides)
+            .or_else(|| {
+                tree.and_then(|tree| tree.parent_side.map(|side| SideSet::from_iter([side])))
+            })
+            .unwrap_or(SideSet::EMPTY);
+        let parent_sides = ParentSides {
+            graph: graph_parent_sides,
+            tree: tree_parent_sides,
+        };
         let parent_signal_key = parent_signal.map(CarrierSignal::key);
         let mut diagonal = forward_carriers(&incoming, parent_signal_key, parent_sides.graph);
         let new_branches =
@@ -257,23 +271,6 @@ fn incoming_signals(graph: &Graph, node: NodeId) -> Vec<CarrierSignal> {
     signals
 }
 
-fn incoming_tree_parent_sides(graph: &Graph, node: NodeId) -> SideSet {
-    graph
-        .parents(node)
-        .filter_map(|(side, parent)| {
-            let megatree = &graph.node_state(parent).megatree;
-            let has_face_branch = megatree
-                .tree
-                .is_some_and(|tree| tree.child_sides.contains(side));
-            let has_diagonal_branch = megatree
-                .outgoing()
-                .iter()
-                .any(|(outgoing_side, _)| *outgoing_side == side);
-            (has_face_branch || has_diagonal_branch).then_some(side)
-        })
-        .collect()
-}
-
 fn propagation_sides(parent_sides: SideSet) -> SideSet {
     eligible_destinations(parent_sides, 1, 1)
         .flat_map(|set| Side::iter().filter(move |side| set.contains(*side)))
@@ -364,16 +361,12 @@ impl MegatreeNode {
         node: NodeId,
         kind: NodeStateKind,
         enviro: EnviroFactors,
-        parent_sides: ParentSides,
+        graph_parent_sides: SideSet,
         incoming: &[CarrierSignal],
         rng: &mut Pcg64Mcg,
     ) -> (Option<Self>, Option<CarrierSignal>) {
         // `Graph::parents` returns every shallower neighbor and the shared side.
         // Parent states have already been finalized by `ensure_node_state`.
-        let ParentSides {
-            graph: graph_parent_sides,
-            tree: tree_parent_sides,
-        } = parent_sides;
         let face_parent = graph
             .parents(node)
             .filter_map(|(side, parent)| {
@@ -411,6 +404,7 @@ impl MegatreeNode {
 
         if let Some((parent_side, parent_growth, incoming_sides, parent_signal)) = parent {
             // Continuation path: inherit growth and select children from the parent side.
+            let tree_parent_sides = incoming_sides;
             let remaining_growth = if matches!(kind, NodeStateKind::Sky | NodeStateKind::DeepSky) {
                 parent_growth - 1.0
                     + rng.sample(Normal::new(0.0, GROWTH_COST_STANDARD_DEVIATION).unwrap())
@@ -593,10 +587,7 @@ mod tests {
             child,
             kind,
             climate(0.0, 10.0),
-            ParentSides {
-                graph: SideSet::from_iter([Side::B]),
-                tree: SideSet::from_iter([Side::B]),
-            },
+            SideSet::from_iter([Side::B]),
             &[],
             &mut rng,
         )
@@ -635,10 +626,7 @@ mod tests {
             NodeId::ROOT,
             NodeStateKind::Land,
             climate(100.0, 10.0),
-            ParentSides {
-                graph: SideSet::EMPTY,
-                tree: SideSet::EMPTY,
-            },
+            SideSet::EMPTY,
             &[],
             &mut rng,
         );
@@ -887,10 +875,7 @@ mod tests {
             NodeId::ROOT,
             NodeStateKind::DeepSky,
             climate(0.0, 10.0),
-            ParentSides {
-                graph: SideSet::EMPTY,
-                tree: signal.target_sides,
-            },
+            SideSet::EMPTY,
             &[signal],
             &mut rng,
         );
