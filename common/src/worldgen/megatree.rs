@@ -9,6 +9,7 @@ use rand::{RngExt, SeedableRng};
 use rand_distr::Normal;
 use rand_pcg::Pcg64Mcg;
 use std::sync::LazyLock;
+use tracing::warn;
 
 use super::{EnviroFactors, NodeStateKind};
 use super::{VoxelCoords, index, line::LineSegment, voxel_center};
@@ -367,23 +368,57 @@ impl MegatreeNode {
     ) -> (Option<Self>, Option<CarrierSignal>) {
         // `Graph::parents` returns every shallower neighbor and the shared side.
         // Parent states have already been finalized by `ensure_node_state`.
-        let face_parent = graph
+        let mut face_parents = graph
             .parents(node)
             .filter_map(|(side, parent)| {
                 graph.node_state(parent).megatree.tree.and_then(|state| {
-                    state
-                        .child_sides
-                        .contains(side)
-                        .then_some((side, state.remaining_growth))
+                    state.child_sides.contains(side).then_some((
+                        side,
+                        parent,
+                        state.remaining_growth,
+                    ))
                 })
             })
-            .min_by_key(|(side, _)| *side as u8);
-        // Prefer the existing face path; stable keys resolve multiple incoming paths predictably.
-        let diagonal_parent = incoming
+            .collect::<Vec<_>>();
+        face_parents.sort_by_key(|(side, _, _)| *side as u8);
+        let mut diagonal_parents = incoming
             .iter()
             .copied()
             .filter(|signal| signal.is_complete())
-            .min_by_key(|signal| signal.key());
+            .collect::<Vec<_>>();
+        diagonal_parents.sort_by_key(|signal| signal.key());
+        diagonal_parents.dedup_by_key(|signal| signal.key());
+
+        let parent_candidate_count = face_parents.len() + diagonal_parents.len();
+        if parent_candidate_count > 1 {
+            let face_parent_candidates = face_parents
+                .iter()
+                .map(|(side, parent, _)| (*side, *parent))
+                .collect::<Vec<_>>();
+            let carrier_parent_candidates = diagonal_parents
+                .iter()
+                .map(|signal| {
+                    (
+                        signal.source,
+                        Side::iter()
+                            .filter(|side| signal.target_sides.contains(*side))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            warn!(
+                ?node,
+                ?face_parent_candidates,
+                ?carrier_parent_candidates,
+                "Multiple distinct megatree branches reached one destination; deterministic parent precedence is being used"
+            );
+        }
+
+        // Keep the existing precedence as a fallback: face parents first, then the lowest signal key.
+        let face_parent = face_parents
+            .first()
+            .map(|(side, _, growth)| (*side, *growth));
+        let diagonal_parent = diagonal_parents.first().copied();
         let parent = face_parent
             .map(|(side, growth)| (Some(side), growth, SideSet::from_iter([side]), None))
             .or_else(|| {
